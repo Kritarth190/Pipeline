@@ -55,7 +55,7 @@ CORS(app, resources={
             "http://localhost:3000",
             "http://localhost:5173",
             FRONTEND_URL,
-            "https://industrial-pipeline.vercel.app/"  # Allow all Vercel deployments
+            "https://pipeline-kappa-topaz.vercel.app/"  # Allow all Vercel deployments
         ],
         "methods": ["GET", "POST", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
