@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment
+.env
+.env.local
+
+# Uploads and processed files
+uploads/
+processed/
+data_versions/
+pipeline.log
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+
+# Frontend build
+dist/
+dist-ssr/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

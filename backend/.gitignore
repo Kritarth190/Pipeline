@@ -1,0 +1,9 @@
+venv/
+*.pyc
+__pycache__/
+*.db
+.env
+uploads/
+processed/
+data_versions/
+*.log
