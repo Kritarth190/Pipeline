@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Upload, LogIn, UserPlus, Database, FileText, BarChart3, Settings, LogOut, Download, Trash2, Play, AlertCircle, CheckCircle, Loader } from 'lucide-react';
 
 // API Configuration
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+const API_BASE_URL = import.meta.env.VITE_API_URL;
 
 const IndustrialPipelineApp = () => {
   const [currentUser, setCurrentUser] = useState(null);
