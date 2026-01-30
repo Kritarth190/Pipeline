@@ -28,7 +28,7 @@ from industrial_pipeline import (
 
 # Initialize Flask app
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-this-in-production')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', '66b6e7a5f5a1d1657699deafc2cf2babbe8fe1e298d974208660a82e75d3f04a')
 # Use PostgreSQL in production, SQLite locally
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///pipeline_users.db')
 
