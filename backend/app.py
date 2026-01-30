@@ -47,20 +47,22 @@ db = SQLAlchemy(app)
 # Create necessary directories
 Path(app.config['UPLOAD_FOLDER']).mkdir(parents=True, exist_ok=True)
 Path(app.config['PROCESSED_FOLDER']).mkdir(parents=True, exist_ok=True)
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+Path("./data_versions").mkdir(parents=True, exist_ok=True)
+# CORS configuration
+FRONTEND_URL = os.environ.get("FRONTEND_URL")
 
 CORS(app, resources={
     r"/api/*": {
         "origins": [
             "http://localhost:3000",
             "http://localhost:5173",
-            FRONTEND_URL,
-            "https://pipeline-kappa-topaz.vercel.app/"  # Allow all Vercel deployments
+            FRONTEND_URL
         ],
         "methods": ["GET", "POST", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
 })
+
 # ============================================================================
 # DATABASE MODELS
 # ============================================================================
@@ -556,14 +558,5 @@ def health_check():
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    print("\n" + "="*70)
-    print("Industrial Data Pipeline API Server")
-    print("="*70)
-    print("Server starting on http://0.0.0.0:5000")
-    print("Features:")
-    print("  ✓ Smart Parameter Detection")
-    print("  ✓ User Authentication")
-    print("  ✓ File Upload & Processing")
-    print("  ✓ Automatic Data Analysis")
-    print("="*70 + "\n")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
