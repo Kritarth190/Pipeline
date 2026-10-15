@@ -7,15 +7,13 @@ UPDATED: Smart Parameter Detection for Any CSV File
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional, Any, Callable
+from typing import Dict, List, Tuple, Optional, Any
 import json
 import logging
 from dataclasses import dataclass, asdict, field
 from abc import ABC, abstractmethod
-import pickle
 import hashlib
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import threading
 import time
@@ -278,7 +276,7 @@ class DataVersionManager:
     
     def save_version(self, data: pd.DataFrame, metadata: Dict) -> str:
         """Save a new data version"""
-        data_hash = hashlib.md5(str(data.values.tobytes()).encode()).hexdigest()
+        data_hash = hashlib.md5(pd.util.hash_pandas_object(data, index=True).values.tobytes()).hexdigest()
         version_id = f"v_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{data_hash[:8]}"
         
         version_path = self.storage_path / version_id
@@ -347,36 +345,15 @@ class PipelineStage(ABC):
 
 
 class DataIngestionStage(PipelineStage):
-    """Smart data ingestion with automatic parameter detection"""
+    """Accepts the uploaded data, or generates synthetic sensor data when none is given"""
     
     def __init__(self):
         super().__init__("Data Ingestion")
-        self.data_analysis = None
     
     def process(self, data: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
         # Check if user provided real data
         if data is not None and not data.empty:
             self.log_info(f"Processing uploaded data: {len(data)} rows × {len(data.columns)} columns")
-            
-            # Analyze the data
-            self.data_analysis = DataAnalyzer.analyze_dataframe(data)
-            
-            # Log detected features
-            self.log_info(f"Detected columns: {self.data_analysis['columns']}")
-            self.log_info(f"Numeric columns: {len(self.data_analysis['numeric_columns'])}")
-            self.log_info(f"Categorical columns: {len(self.data_analysis['categorical_columns'])}")
-            self.log_info(f"DateTime columns: {len(self.data_analysis['datetime_columns'])}")
-            
-            # Log detected features
-            features = self.data_analysis['detected_features']
-            detected = [k.replace('has_', '').replace('is_', '') for k, v in features.items() if v]
-            if detected:
-                self.log_info(f"Detected features: {', '.join(detected)}")
-            
-            # Log data quality
-            if self.data_analysis['missing_values']:
-                self.log_info(f"Columns with missing values: {len(self.data_analysis['missing_values'])}")
-            
             return data
         
         # Only generate synthetic data if no data provided
@@ -1029,7 +1006,7 @@ class IndustrialDataPipeline:
                     'metrics': asdict(self.metrics),
                     'config': asdict(self.config)
                 }
-                version_id = self.version_manager.save_version(data, version_metadata)
+                self.version_manager.save_version(data, version_metadata)
             
             # Save to databases
             for connector in self.db_connectors:
@@ -1154,7 +1131,7 @@ def main():
     
     # Export results
     export_paths = pipeline.export_results(processed_data)
-    print(f"\nResults exported to:")
+    print("\nResults exported to:")
     for format_type, path in export_paths.items():
         print(f"  {format_type}: {path}")
     
