@@ -6,29 +6,35 @@ from werkzeug.utils import secure_filename
 import jwt
 from datetime import datetime, timedelta
 from functools import wraps
+from dataclasses import asdict
 import pandas as pd
 import os
-import io
 import json
 from pathlib import Path
-import traceback
+import secrets
+import threading
+import logging
 
-# Import your original pipeline
-import sys
-sys.path.append('.')
+from rag_prep import RAGConfig, build_rag_dataset, analyze_text_columns, load_text_table
+from dataset_sources import fetch_huggingface, fetch_kaggle, DatasetImportError
 from industrial_pipeline import (
     IndustrialDataPipeline, 
     PipelineConfig, 
     DatabaseConfig,
-    StreamConfig,
-    MLConfig,
-    MonitoringConfig,
-    DataAnalyzer  # Import the smart analyzer
+    DataAnalyzer
 )
+
+logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', '66b6e7a5f5a1d1657699deafc2cf2babbe8fe1e298d974208660a82e75d3f04a')
+# Never keep a real secret in the source code. If SECRET_KEY isn't set we use a
+# random one for this process (logins are invalidated on every restart).
+_secret = os.environ.get('SECRET_KEY')
+if not _secret:
+    logging.warning("SECRET_KEY is not set - using a temporary random key. Set it in your environment.")
+    _secret = secrets.token_hex(32)
+app.config['SECRET_KEY'] = _secret
 # Use PostgreSQL in production, SQLite locally
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///pipeline_users.db')
 
@@ -38,9 +44,11 @@ if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
 
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['UPLOAD_FOLDER'] = './uploads'
-app.config['PROCESSED_FOLDER'] = './processed'
+app.config['UPLOAD_FOLDER'] = os.path.abspath('./uploads')
+app.config['PROCESSED_FOLDER'] = os.path.abspath('./processed')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
+# Hard ceiling on rows per RAG job / dataset import (protects small free-tier hosts)
+MAX_RAG_ROWS = int(os.environ.get('MAX_RAG_ROWS', '20000'))
 
 db = SQLAlchemy(app)
 
@@ -56,7 +64,7 @@ CORS(app, resources={
         "origins": [
             "http://localhost:3000",
             "http://localhost:5173",
-            FRONTEND_URL
+            *([FRONTEND_URL] if FRONTEND_URL else [])
         ],
         "methods": ["GET", "POST", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
@@ -156,7 +164,7 @@ def token_required(f):
                 token = token[7:]
             
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            current_user = User.query.get(data['user_id'])
+            current_user = db.session.get(User, data['user_id'])
             
             if not current_user:
                 return jsonify({'message': 'User not found'}), 401
@@ -329,64 +337,24 @@ def process_data(current_user):
         # Get smart configuration suggestions
         smart_config = DataAnalyzer.suggest_pipeline_config(analysis)
         
-        # Debug output - show what was detected
-        print(f"\n{'='*70}")
-        print(f"SMART PARAMETER DETECTION")
-        print(f"{'='*70}")
-        print(f"File: {file_obj.original_filename}")
-        print(f"User: {current_user.username}")
-        print(f"\n--- DATA ANALYSIS ---")
-        print(f"Rows: {analysis['total_rows']}")
-        print(f"Columns: {analysis['total_columns']}")
-        print(f"Column Names: {analysis['columns']}")
-        print(f"Numeric Columns: {analysis['numeric_columns']}")
-        print(f"Categorical Columns: {analysis['categorical_columns']}")
-        print(f"DateTime Columns: {analysis['datetime_columns']}")
-        
-        if analysis['missing_values']:
-            print(f"\n--- MISSING VALUES ---")
-            for col, pct in analysis['missing_values'].items():
-                print(f"  {col}: {pct:.1%}")
-        
-        print(f"\n--- DETECTED FEATURES ---")
-        for feature, present in analysis['detected_features'].items():
-            if present:
-                print(f"  ✓ {feature}")
-        
-        print(f"\n--- SMART CONFIGURATION ---")
-        for key, value in smart_config.items():
-            if key != 'reasons':
-                print(f"  {key}: {value}")
-        
-        if smart_config['reasons']:
-            print(f"\n--- CONFIGURATION REASONS ---")
-            for reason in smart_config['reasons']:
-                print(f"  • {reason}")
-        
-        print(f"{'='*70}\n")
-        
+        logger.info("Smart detection for '%s' (user %s): %d rows x %d cols, features=%s, suggestions=%s",
+                    file_obj.original_filename, current_user.username,
+                    analysis['total_rows'], analysis['total_columns'],
+                    [k for k, v in analysis['detected_features'].items() if v],
+                    smart_config['reasons'])
+
         # Get user's configuration or use smart suggestions
         pipeline_config_data = data.get('config', {})
         
         # Merge user config with smart suggestions (user config takes priority)
-        final_config = {
-            'validation_enabled': pipeline_config_data.get('validation_enabled', smart_config['validation_enabled']),
-            'outlier_detection_enabled': pipeline_config_data.get('outlier_detection_enabled', smart_config['outlier_detection_enabled']),
-            'normalization_enabled': pipeline_config_data.get('normalization_enabled', smart_config['normalization_enabled']),
-            'feature_engineering_enabled': pipeline_config_data.get('feature_engineering_enabled', smart_config['feature_engineering_enabled']),
-            'missing_value_threshold': pipeline_config_data.get('missing_value_threshold', smart_config['missing_value_threshold']),
-            'outlier_std_threshold': pipeline_config_data.get('outlier_std_threshold', smart_config['outlier_std_threshold'])
-        }
-        
+        tunable = ['validation_enabled', 'outlier_detection_enabled', 'normalization_enabled',
+                   'feature_engineering_enabled', 'missing_value_threshold', 'outlier_std_threshold']
+        final_config = {k: pipeline_config_data.get(k, smart_config[k]) for k in tunable}
+
         # Create pipeline configuration
         config = PipelineConfig(
             batch_size=len(input_data),
-            validation_enabled=final_config['validation_enabled'],
-            outlier_detection_enabled=final_config['outlier_detection_enabled'],
-            normalization_enabled=final_config['normalization_enabled'],
-            feature_engineering_enabled=final_config['feature_engineering_enabled'],
-            missing_value_threshold=final_config['missing_value_threshold'],
-            outlier_std_threshold=final_config['outlier_std_threshold'],
+            **final_config,
             enable_versioning=True,
             version_storage_path=f"./data_versions/user_{current_user.id}",
             database=DatabaseConfig(
@@ -399,20 +367,10 @@ def process_data(current_user):
         pipeline = IndustrialDataPipeline(config)
         processed_data, metrics = pipeline.run(input_data)
         
-        # Debug output after processing
-        print(f"\n{'='*70}")
-        print(f"PROCESSING COMPLETED")
-        print(f"{'='*70}")
-        print(f"Input Records: {metrics.total_records}")
-        print(f"Valid Records: {metrics.valid_records}")
-        print(f"Invalid Records: {metrics.invalid_records}")
-        print(f"Processing Time: {metrics.processing_time:.2f}s")
-        print(f"Data Quality: {metrics.data_quality_score:.2%}")
-        print(f"Throughput: {metrics.throughput:.0f} records/sec")
-        print(f"\nOutput Shape: {len(processed_data)} rows × {len(processed_data.columns)} columns")
-        print(f"Output Columns (first 10): {list(processed_data.columns)[:10]}...")
-        print(f"{'='*70}\n")
-        
+        logger.info("Processed '%s': %d/%d valid records in %.2fs, quality %.2f%%, %d output columns",
+                    file_obj.original_filename, metrics.valid_records, metrics.total_records,
+                    metrics.processing_time, metrics.data_quality_score * 100, len(processed_data.columns))
+
         # Save processed data
         output_filename = f"processed_{file_obj.filename}"
         output_path = os.path.join(app.config['PROCESSED_FOLDER'], output_filename)
@@ -458,17 +416,8 @@ def process_data(current_user):
         }), 200
         
     except Exception as e:
-        # Enhanced error handling with traceback
-        error_details = traceback.format_exc()
-        
-        print(f"\n{'='*70}")
-        print(f"PROCESSING ERROR")
-        print(f"{'='*70}")
-        print(f"Error: {str(e)}")
-        print(f"\nFull Traceback:")
-        print(error_details)
-        print(f"{'='*70}\n")
-        
+        logger.exception("Processing failed for file %s", file_obj.id)
+
         file_obj.status = 'error'
         
         job = ProcessedJob(
@@ -497,7 +446,7 @@ def get_jobs(current_user):
     for job in jobs:
         job_dict = job.to_dict()
         if job.file_id:
-            file_obj = UploadedFile.query.get(job.file_id)
+            file_obj = db.session.get(UploadedFile, job.file_id)
             if file_obj:
                 job_dict['filename'] = file_obj.original_filename
         result.append(job_dict)
@@ -517,11 +466,169 @@ def download_processed(current_user, job_id):
     if not job.output_path or not os.path.exists(job.output_path):
         return jsonify({'message': 'Processed file not found'}), 404
     
+    if job.output_path.endswith('.jsonl'):
+        return send_file(
+            job.output_path,
+            as_attachment=True,
+            download_name=f"rag_chunks_{job.id}.jsonl",
+            mimetype='application/x-ndjson'
+        )
+
     return send_file(
         job.output_path,
         as_attachment=True,
         download_name=f"processed_{job.id}.csv"
     )
+
+
+# ============================================================================
+# API ROUTES - RAG PREPARATION (tokenizer + embedder) AND DATASET IMPORT
+# ============================================================================
+
+# Only one RAG job runs at a time so a small host never runs out of memory.
+_rag_slot = threading.Semaphore(1)
+
+
+def _save_imported_csv(current_user, label, writer):
+    """Create the UploadedFile row for a dataset fetched from a remote source."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    safe_label = secure_filename(label) or 'dataset'
+    filename = f"{current_user.id}_{timestamp}_{safe_label}.csv"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    info = writer(file_path)
+    record = UploadedFile(
+        user_id=current_user.id,
+        filename=filename,
+        original_filename=f"{safe_label}.csv",
+        file_path=file_path,
+        file_size=os.path.getsize(file_path)
+    )
+    db.session.add(record)
+    db.session.commit()
+    return record, info
+
+
+@app.route('/api/datasets/import', methods=['POST'])
+@token_required
+def import_dataset(current_user):
+    """Import a dataset from Hugging Face or Kaggle as an uploaded file."""
+    data = request.get_json() or {}
+    source = data.get('source')
+    dataset_id = (data.get('dataset') or '').strip()
+    try:
+        max_rows = max(1, min(int(data.get('max_rows', 2000)), MAX_RAG_ROWS))
+    except (TypeError, ValueError):
+        max_rows = 2000
+
+    if source not in ('huggingface', 'kaggle') or not dataset_id:
+        return jsonify({'message': "Provide 'source' (huggingface or kaggle) and 'dataset'"}), 400
+
+    try:
+        if source == 'huggingface':
+            record, info = _save_imported_csv(
+                current_user, dataset_id.replace('/', '_'),
+                lambda p: fetch_huggingface(dataset_id, p, data.get('config') or None,
+                                            data.get('split') or None, max_rows))
+        else:
+            record, info = _save_imported_csv(
+                current_user, dataset_id.replace('/', '_'),
+                lambda p: fetch_kaggle(dataset_id, p, data.get('file') or None, max_rows))
+    except DatasetImportError as e:
+        return jsonify({'message': str(e)}), 400
+    except Exception as e:
+        logger.exception("Dataset import failed")
+        return jsonify({'message': f'Import failed: {e}'}), 500
+
+    return jsonify({'message': 'Dataset imported', 'file': record.to_dict(), 'import': info}), 201
+
+
+@app.route('/api/files/<int:file_id>/columns', methods=['GET'])
+@token_required
+def file_columns(current_user, file_id):
+    """List a file's columns and suggest which ones hold text for the RAG step."""
+    file_obj = UploadedFile.query.filter_by(id=file_id, user_id=current_user.id).first()
+    if not file_obj:
+        return jsonify({'message': 'File not found'}), 404
+    try:
+        df = load_text_table(file_obj.file_path, 500)
+        return jsonify(analyze_text_columns(df)), 200
+    except Exception as e:
+        return jsonify({'message': f'Could not read file: {e}'}), 400
+
+
+def _run_rag_job(job_id, file_path, output_path, cfg):
+    """Background worker: runs the RAG preparation and records the result."""
+    with app.app_context():
+        job = db.session.get(ProcessedJob, job_id)
+        file_obj = db.session.get(UploadedFile, job.file_id)
+        _rag_slot.acquire()
+        try:
+            job.status = 'running'
+            db.session.commit()
+
+            def on_progress(p):
+                job.metrics = json.dumps(p)
+                db.session.commit()
+
+            df = load_text_table(file_path, cfg.max_rows)
+            stats = build_rag_dataset(df, cfg, output_path, progress_cb=on_progress)
+
+            job.metrics = json.dumps(stats)
+            job.output_path = output_path
+            job.status = 'completed'
+            file_obj.status = 'processed'
+        except Exception as e:
+            logger.exception("RAG job %s failed", job_id)
+            db.session.rollback()
+            job = db.session.get(ProcessedJob, job_id)
+            file_obj = db.session.get(UploadedFile, job.file_id)
+            job.status = 'failed'
+            job.error_message = str(e)
+            file_obj.status = 'error'
+        finally:
+            _rag_slot.release()
+            db.session.commit()
+            db.session.remove()
+
+
+@app.route('/api/rag/process', methods=['POST'])
+@token_required
+def process_rag(current_user):
+    """Start a background job: clean -> tokenize/chunk -> embed -> JSONL."""
+    data = request.get_json() or {}
+    if not data.get('file_id'):
+        return jsonify({'message': 'File ID is required'}), 400
+
+    file_obj = UploadedFile.query.filter_by(id=data['file_id'], user_id=current_user.id).first()
+    if not file_obj:
+        return jsonify({'message': 'File not found'}), 404
+
+    busy = ProcessedJob.query.filter(
+        ProcessedJob.user_id == current_user.id,
+        ProcessedJob.status.in_(['pending', 'running'])
+    ).first()
+    if busy:
+        return jsonify({'message': 'You already have a job running. Wait for it to finish.'}), 409
+
+    cfg = RAGConfig.from_dict(data.get('config'), max_rows_cap=MAX_RAG_ROWS)
+    if cfg.embed and cfg.embedder == 'hf_api' and not os.environ.get('HF_TOKEN'):
+        return jsonify({'message': 'The server has no HF_TOKEN set, so it cannot create embeddings. '
+                                   'Add HF_TOKEN, or turn embeddings off to export chunks only.'}), 400
+
+    output_path = os.path.join(app.config['PROCESSED_FOLDER'], f"rag_{file_obj.filename.rsplit('.', 1)[0]}.jsonl")
+    job = ProcessedJob(
+        user_id=current_user.id,
+        file_id=file_obj.id,
+        config=json.dumps({**asdict(cfg), 'mode': 'rag'}),
+        metrics=json.dumps({'mode': 'rag', 'progress': 0}),
+        status='pending'
+    )
+    file_obj.status = 'processing'
+    db.session.add(job)
+    db.session.commit()
+
+    threading.Thread(target=_run_rag_job, args=(job.id, file_obj.file_path, output_path, cfg), daemon=True).start()
+    return jsonify({'message': 'RAG job started', 'job': job.to_dict()}), 202
 
 
 # ============================================================================
@@ -555,8 +662,21 @@ def health_check():
 # INITIALIZATION
 # ============================================================================
 
+# Runs on import so it also works under gunicorn (which never executes __main__)
+with app.app_context():
+    db.create_all()
+    # A restart kills background threads, so jobs left "running" can never finish.
+    stale = ProcessedJob.query.filter(ProcessedJob.status.in_(['pending', 'running'])).all()
+    for stale_job in stale:
+        stale_job.status = 'failed'
+        stale_job.error_message = 'Interrupted by a server restart. Please run it again.'
+        if stale_job.file_id:
+            f = db.session.get(UploadedFile, stale_job.file_id)
+            if f:
+                f.status = 'uploaded'
+    db.session.commit()
+
+
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

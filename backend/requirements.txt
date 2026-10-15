@@ -5,6 +5,11 @@ PyJWT
 pandas
 numpy
 Werkzeug
-python-dotenv
 gunicorn
 psycopg2-binary
+requests
+tokenizers
+huggingface_hub
+kaggle
+# Optional: local embeddings instead of the Hugging Face API (needs ~200 MB RAM)
+# fastembed
