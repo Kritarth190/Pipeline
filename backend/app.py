@@ -9,6 +9,7 @@ from functools import wraps
 from dataclasses import asdict
 import pandas as pd
 import os
+import re
 import json
 from pathlib import Path
 import secrets
@@ -38,9 +39,10 @@ app.config['SECRET_KEY'] = _secret
 # Use PostgreSQL in production, SQLite locally
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///pipeline_users.db')
 
-# Fix for SQLAlchemy (Render uses postgres:// but SQLAlchemy needs postgresql://)
-if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
-    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+# Normalise any Postgres URL (postgres://, postgresql://, postgresql+psycopg://, ...) to the
+# psycopg2 driver we install. Newer SQLAlchemy defaults plain postgresql:// to psycopg v3,
+# which is not installed here and crashes the app on start.
+DATABASE_URL = re.sub(r'^postgres(ql)?(\+\w+)?://', 'postgresql+psycopg2://', DATABASE_URL)
 
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
