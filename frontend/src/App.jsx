@@ -25,9 +25,11 @@ const IndustrialPipelineApp = () => {
     chunk_tokens: 256,
     chunk_overlap: 32,
     embed: true,
+    embedder: 'scratch',
     embedding_model: 'BAAI/bge-small-en-v1.5',
     max_rows: 2000
   });
+  const [embedders, setEmbedders] = useState(null);
   const [ragFileId, setRagFileId] = useState('');
   const [columnInfo, setColumnInfo] = useState(null);
   const [importForm, setImportForm] = useState({ source: 'huggingface', dataset: '', max_rows: 2000, file: '' });
@@ -63,6 +65,26 @@ const IndustrialPipelineApp = () => {
   }, [hasActiveJob, token]);
 
   const authHeaders = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+  // Find out which embedders the server can run, and pick a sensible default
+  useEffect(() => {
+    if (view !== 'rag' || !token || embedders) return;
+    (async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/embedders`, { headers: authHeaders });
+        if (!response.ok) return;
+        const data = await response.json();
+        setEmbedders(data);
+        setRagConfig(cfg => data.scratch.available
+          ? { ...cfg, embedder: 'scratch' }
+          : data.hf_api.available
+            ? { ...cfg, embedder: 'hf_api' }
+            : { ...cfg, embed: false });
+      } catch (err) {
+        console.error('Failed to load embedders:', err);
+      }
+    })();
+  }, [view]);
 
   const handleRagFileSelect = async (fileId) => {
     setRagFileId(fileId);
@@ -876,16 +898,37 @@ const IndustrialPipelineApp = () => {
                     />
                     Create embeddings
                   </label>
-                  <input
-                    type="text"
+                  <select
                     disabled={!ragConfig.embed}
-                    value={ragConfig.embedding_model}
-                    onChange={(e) => setRagConfig({ ...ragConfig, embedding_model: e.target.value })}
-                    className="w-full px-3 py-2 border border-gray-300 rounded disabled:opacity-50"
-                  />
-                  <p className="text-xs text-gray-500 mt-1">
-                    Hugging Face model id. The tokenizer is matched to this model automatically.
-                  </p>
+                    value={ragConfig.embedder}
+                    onChange={(e) => setRagConfig({ ...ragConfig, embedder: e.target.value })}
+                    className="w-full px-3 py-2 border border-gray-300 rounded disabled:opacity-50 mb-2"
+                  >
+                    <option value="scratch">
+                      Trained from scratch (free){embedders && !embedders.scratch.available ? ' - not installed' : ''}
+                    </option>
+                    <option value="hf_api">
+                      Hugging Face API (paid credits){embedders && !embedders.hf_api.available ? ' - no token' : ''}
+                    </option>
+                  </select>
+                  {ragConfig.embed && ragConfig.embedder === 'scratch' && embedders?.scratch.available && (
+                    <p className="text-xs text-gray-500">
+                      Model: {embedders.scratch.name} · {embedders.scratch.dim} dimensions
+                    </p>
+                  )}
+                  {ragConfig.embed && ragConfig.embedder === 'scratch' && embedders && !embedders.scratch.available && (
+                    <p className="text-xs text-amber-700">
+                      No trained model on the server yet. Train one from your chunks (see the README) or untick embeddings.
+                    </p>
+                  )}
+                  {ragConfig.embed && ragConfig.embedder === 'hf_api' && (
+                    <input
+                      type="text"
+                      value={ragConfig.embedding_model}
+                      onChange={(e) => setRagConfig({ ...ragConfig, embedding_model: e.target.value })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded"
+                    />
+                  )}
                 </div>
                 <div className="p-4 bg-gray-50 rounded">
                   <label className="block font-medium mb-2">Max rows to process</label>

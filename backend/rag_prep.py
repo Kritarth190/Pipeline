@@ -52,7 +52,7 @@ class RAGConfig:
     chunk_overlap: int = 32
     min_doc_tokens: int = 5
     embed: bool = True
-    embedder: str = "hf_api"                                 # hf_api | fastembed
+    embedder: str = "hf_api"                                 # hf_api | fastembed | scratch
     embedding_model: str = DEFAULT_MODEL
     batch_size: int = 32
     max_rows: int = 5000
@@ -85,7 +85,7 @@ class RAGConfig:
         cfg.batch_size = clamp_int(raw.get("batch_size"), cfg.batch_size, 1, 128)
         cfg.embed = bool(raw.get("embed", True))
         cfg.dedupe = bool(raw.get("dedupe", True))
-        if raw.get("embedder") in ("hf_api", "fastembed"):
+        if raw.get("embedder") in ("hf_api", "fastembed", "scratch"):
             cfg.embedder = raw["embedder"]
         for key in ("tokenizer_name", "embedding_model"):
             value = raw.get(key)
@@ -281,6 +281,10 @@ class FastEmbedEmbedder(Embedder):
 
 
 def get_embedder(cfg: RAGConfig) -> Embedder:
+    if cfg.embedder == "scratch":
+        from scratch_embedder import ScratchEmbedder  # imported here: it imports this module
+
+        return ScratchEmbedder()
     if cfg.embedder == "fastembed":
         return FastEmbedEmbedder(cfg.embedding_model)
     return HFAPIEmbedder(cfg.embedding_model)

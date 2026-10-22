@@ -1,0 +1,5 @@
+# Only needed to TRAIN the embedder (on your computer or free Google Colab).
+# The deployed backend does not need any of this.
+torch
+tokenizers
+numpy

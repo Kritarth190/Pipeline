@@ -18,6 +18,7 @@ import logging
 
 from rag_prep import RAGConfig, build_rag_dataset, analyze_text_columns, load_text_table
 from dataset_sources import fetch_huggingface, fetch_kaggle, DatasetImportError
+from scratch_embedder import scratch_model_info
 from industrial_pipeline import (
     IndustrialDataPipeline, 
     PipelineConfig, 
@@ -593,6 +594,19 @@ def _run_rag_job(job_id, file_path, output_path, cfg):
             db.session.remove()
 
 
+@app.route('/api/embedders', methods=['GET'])
+@token_required
+def list_embedders(current_user):
+    """Which embedders this server can actually run right now."""
+    info = scratch_model_info()
+    return jsonify({
+        'scratch': {'available': info is not None,
+                    'dim': info.get('dim') if info else None,
+                    'name': info.get('name') if info else None},
+        'hf_api': {'available': bool(os.environ.get('HF_TOKEN'))}
+    }), 200
+
+
 @app.route('/api/rag/process', methods=['POST'])
 @token_required
 def process_rag(current_user):
@@ -613,6 +627,10 @@ def process_rag(current_user):
         return jsonify({'message': 'You already have a job running. Wait for it to finish.'}), 409
 
     cfg = RAGConfig.from_dict(data.get('config'), max_rows_cap=MAX_RAG_ROWS)
+    if cfg.embed and cfg.embedder == 'scratch' and scratch_model_info() is None:
+        return jsonify({'message': 'No trained from-scratch embedder is installed on the server. '
+                                   'Train one with tools/train_embedder.py, add it to backend/models/scratch-embedder, '
+                                   'or turn embeddings off.'}), 400
     if cfg.embed and cfg.embedder == 'hf_api' and not os.environ.get('HF_TOKEN'):
         return jsonify({'message': 'The server has no HF_TOKEN set, so it cannot create embeddings. '
                                    'Add HF_TOKEN, or turn embeddings off to export chunks only.'}), 400
