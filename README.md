@@ -45,6 +45,32 @@ npm run dev
 
 Frontend runs on: http://localhost:3000
 
+## RAG preparation and the from-scratch embedder
+
+The **RAG Prep** tab turns a text dataset (uploaded, or imported from Hugging Face / Kaggle) into
+token-sized chunks, optionally with embeddings, as a `.jsonl` file you can load into a vector store.
+
+Embeddings come from a small model you train yourself on your own data (free, and it runs on the
+Render free tier because inference is plain numpy):
+
+1. **Export chunks.** In RAG Prep, pick your dataset, untick *Create embeddings*, build, then download
+   the `.jsonl` from the Results tab.
+2. **Train** (a few minutes on a laptop or free Google Colab, no GPU needed):
+   ```bash
+   pip install -r tools/requirements-train.txt
+   python tools/train_embedder.py chunks.jsonl --out my-embedder
+   ```
+   It prints held-out retrieval scores at the end. Use `--group-key metadata.<column>` if a column
+   (e.g. a category) marks which chunks belong together; the default groups chunks by `doc_id`.
+3. **Install.** Copy the files from `my-embedder/` into `backend/models/scratch-embedder/`, commit and push.
+4. **Embed.** Run RAG Prep again with *Trained from scratch (free)* selected.
+
+Good to know:
+- It is a bag-of-words model: it captures topical similarity in *your* data, not grammar or word order,
+  and it will not match large pretrained models. Use thousands of chunks or more.
+- Queries must be embedded with the same model (`from scratch_embedder import ScratchEmbedder`).
+  If you retrain, re-embed everything.
+
 ## Usage
 
 1. Register a new account
@@ -64,6 +90,10 @@ Frontend runs on: http://localhost:3000
 - `POST /api/process` - Process file
 - `GET /api/jobs` - List jobs
 - `GET /api/jobs/<id>/download` - Download result
+- `POST /api/datasets/import` - Import a Hugging Face / Kaggle dataset
+- `GET /api/files/<id>/columns` - List columns and suggest text columns
+- `GET /api/embedders` - Which embedders the server can run
+- `POST /api/rag/process` - Start a RAG chunking/embedding job
 
 ## Tech Stack
 
