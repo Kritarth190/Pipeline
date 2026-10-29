@@ -15,9 +15,11 @@ from pathlib import Path
 import secrets
 import threading
 import logging
+import uuid
+from werkzeug.exceptions import HTTPException
 
 from rag_prep import RAGConfig, build_rag_dataset, analyze_text_columns, load_text_table
-from dataset_sources import fetch_huggingface, fetch_kaggle, DatasetImportError
+from dataset_sources import fetch_huggingface, fetch_kaggle, normalize_dataset_id, DatasetImportError
 from scratch_embedder import scratch_model_info
 from industrial_pipeline import (
     IndustrialDataPipeline, 
@@ -151,6 +153,45 @@ class ProcessedJob(db.Model):
 
 
 # ============================================================================
+# HELPERS AND ERROR HANDLING
+# ============================================================================
+
+EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+
+
+def _stamp():
+    """Unique-per-call stamp for file names (a second-resolution time alone collides)."""
+    return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+
+def _body():
+    """JSON body as a dict (empty dict if missing, malformed or not an object)."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def _remove_quietly(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        logger.warning("Could not remove %s", path)
+
+
+@app.errorhandler(HTTPException)
+def json_http_error(e):
+    # The frontend always parses JSON; Flask's default HTML error pages show up as "Network error"
+    messages = {413: 'File is too large (limit is 50 MB)'}
+    return jsonify({'message': messages.get(e.code, e.description or e.name)}), e.code
+
+
+@app.errorhandler(Exception)
+def json_server_error(e):
+    logger.exception("Unhandled error")
+    return jsonify({'message': 'Internal server error'}), 500
+
+
+# ============================================================================
 # AUTHENTICATION DECORATOR
 # ============================================================================
 
@@ -167,7 +208,10 @@ def token_required(f):
                 token = token[7:]
             
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            current_user = db.session.get(User, data['user_id'])
+            user_id = data.get('user_id')
+            if not isinstance(user_id, int):
+                return jsonify({'message': 'Invalid token'}), 401
+            current_user = db.session.get(User, user_id)
             
             if not current_user:
                 return jsonify({'message': 'User not found'}), 401
@@ -189,18 +233,23 @@ def token_required(f):
 @app.route('/api/register', methods=['POST'])
 def register():
     """Register a new user"""
-    data = request.get_json()
+    data = _body()
+    username = str(data.get('username') or '').strip()
+    email = str(data.get('email') or '').strip().lower()
     
-    if not data or not data.get('username') or not data.get('email') or not data.get('password'):
+    if not username or not email or not data.get('password'):
         return jsonify({'message': 'Missing required fields'}), 400
     
-    if User.query.filter_by(username=data['username']).first():
+    if not EMAIL_RE.match(email):
+        return jsonify({'message': 'Please enter a valid email address'}), 400
+    
+    if User.query.filter_by(username=username).first():
         return jsonify({'message': 'Username already exists'}), 400
     
-    if User.query.filter_by(email=data['email']).first():
+    if User.query.filter(db.func.lower(User.email) == email).first():
         return jsonify({'message': 'Email already exists'}), 400
     
-    user = User(username=data['username'], email=data['email'])
+    user = User(username=username, email=email)
     user.set_password(data['password'])
     
     db.session.add(user)
@@ -215,9 +264,9 @@ def register():
 @app.route('/api/login', methods=['POST'])
 def login():
     """Login user and return JWT token"""
-    data = request.get_json()
+    data = _body()
     
-    if not data or not data.get('username') or not data.get('password'):
+    if not data.get('username') or not data.get('password'):
         return jsonify({'message': 'Missing credentials'}), 400
     
     user = User.query.filter_by(username=data['username']).first()
@@ -255,9 +304,10 @@ def upload_file(current_user):
     if not file.filename.lower().endswith(('.csv', '.txt')):
         return jsonify({'message': 'Only CSV and TXT files are allowed'}), 400
     
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    original_filename = secure_filename(file.filename)
-    filename = f"{current_user.id}_{timestamp}_{original_filename}"
+    # secure_filename drops non-ASCII letters (even the whole name), so keep the extension separately
+    stem, ext = os.path.splitext(file.filename)
+    original_filename = f"{secure_filename(stem) or 'file'}{ext.lower()}"
+    filename = f"{current_user.id}_{_stamp()}_{original_filename}"
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     
     file.save(file_path)
@@ -299,11 +349,15 @@ def delete_file(current_user, file_id):
     if not file_obj:
         return jsonify({'message': 'File not found'}), 404
     
-    if os.path.exists(file_obj.file_path):
-        os.remove(file_obj.file_path)
-    
+    # Results of this file go with it (and their rows reference the file, so they must be removed first)
+    jobs = ProcessedJob.query.filter_by(file_id=file_obj.id).all()
+    paths = [file_obj.file_path] + [j.output_path for j in jobs]
+    for job in jobs:
+        db.session.delete(job)
     db.session.delete(file_obj)
     db.session.commit()
+    for path in paths:
+        _remove_quietly(path)
     
     return jsonify({'message': 'File deleted successfully'}), 200
 
@@ -312,14 +366,37 @@ def delete_file(current_user, file_id):
 # API ROUTES - PIPELINE PROCESSING WITH SMART DETECTION
 # ============================================================================
 
+def _validate_pipeline_config(cfg):
+    """Return an error message if the user's pipeline config is unusable, else None."""
+    if not isinstance(cfg, dict):
+        return "'config' must be an object"
+    for key in ('validation_enabled', 'outlier_detection_enabled', 'normalization_enabled',
+                'feature_engineering_enabled'):
+        if key in cfg and not isinstance(cfg[key], bool):
+            return f"'{key}' must be true or false"
+    for key, low, high in (('missing_value_threshold', 0.0, 1.0), ('outlier_std_threshold', 0.1, 100.0)):
+        if key in cfg:
+            v = cfg[key]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not low <= v <= high:
+                return f"'{key}' must be a number between {low} and {high}"
+    return None
+
+
 @app.route('/api/process', methods=['POST'])
 @token_required
 def process_data(current_user):
     """Process uploaded file through pipeline with smart parameter detection"""
-    data = request.get_json()
+    data = _body()
     
-    if not data or not data.get('file_id'):
+    if not data.get('file_id'):
         return jsonify({'message': 'File ID is required'}), 400
+    
+    pipeline_config_data = data.get('config', {})
+    if pipeline_config_data is None:
+        pipeline_config_data = {}
+    config_error = _validate_pipeline_config(pipeline_config_data)
+    if config_error:
+        return jsonify({'message': config_error}), 400
     
     file_obj = UploadedFile.query.filter_by(id=data['file_id'], user_id=current_user.id).first()
     
@@ -332,6 +409,8 @@ def process_data(current_user):
     try:
         # Read the uploaded file
         input_data = pd.read_csv(file_obj.file_path)
+        if input_data.empty:
+            raise ValueError('The file has no data rows')
         
         # ============ SMART PARAMETER DETECTION ============
         # Analyze the uploaded data
@@ -346,9 +425,6 @@ def process_data(current_user):
                     [k for k, v in analysis['detected_features'].items() if v],
                     smart_config['reasons'])
 
-        # Get user's configuration or use smart suggestions
-        pipeline_config_data = data.get('config', {})
-        
         # Merge user config with smart suggestions (user config takes priority)
         tunable = ['validation_enabled', 'outlier_detection_enabled', 'normalization_enabled',
                    'feature_engineering_enabled', 'missing_value_threshold', 'outlier_std_threshold']
@@ -375,7 +451,7 @@ def process_data(current_user):
                     metrics.processing_time, metrics.data_quality_score * 100, len(processed_data.columns))
 
         # Save processed data
-        output_filename = f"processed_{file_obj.filename}"
+        output_filename = f"processed_{_stamp()}_{file_obj.filename}"
         output_path = os.path.join(app.config['PROCESSED_FOLDER'], output_filename)
         processed_data.to_csv(output_path, index=False)
         
@@ -494,9 +570,8 @@ _rag_slot = threading.Semaphore(1)
 
 def _save_imported_csv(current_user, label, writer):
     """Create the UploadedFile row for a dataset fetched from a remote source."""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     safe_label = secure_filename(label) or 'dataset'
-    filename = f"{current_user.id}_{timestamp}_{safe_label}.csv"
+    filename = f"{current_user.id}_{_stamp()}_{safe_label}.csv"
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     info = writer(file_path)
     record = UploadedFile(
@@ -515,9 +590,9 @@ def _save_imported_csv(current_user, label, writer):
 @token_required
 def import_dataset(current_user):
     """Import a dataset from Hugging Face or Kaggle as an uploaded file."""
-    data = request.get_json() or {}
+    data = _body()
     source = data.get('source')
-    dataset_id = (data.get('dataset') or '').strip()
+    dataset_id = normalize_dataset_id(source, str(data.get('dataset') or ''))
     try:
         max_rows = max(1, min(int(data.get('max_rows', 2000)), MAX_RAG_ROWS))
     except (TypeError, ValueError):
@@ -588,6 +663,7 @@ def _run_rag_job(job_id, file_path, output_path, cfg):
             job.status = 'failed'
             job.error_message = str(e)
             file_obj.status = 'error'
+            _remove_quietly(output_path)  # never leave a half-written file behind
         finally:
             _rag_slot.release()
             db.session.commit()
@@ -611,7 +687,7 @@ def list_embedders(current_user):
 @token_required
 def process_rag(current_user):
     """Start a background job: clean -> tokenize/chunk -> embed -> JSONL."""
-    data = request.get_json() or {}
+    data = _body()
     if not data.get('file_id'):
         return jsonify({'message': 'File ID is required'}), 400
 
@@ -626,6 +702,8 @@ def process_rag(current_user):
     if busy:
         return jsonify({'message': 'You already have a job running. Wait for it to finish.'}), 409
 
+    if data.get('config') is not None and not isinstance(data['config'], dict):
+        return jsonify({'message': "'config' must be an object"}), 400
     cfg = RAGConfig.from_dict(data.get('config'), max_rows_cap=MAX_RAG_ROWS)
     if cfg.embed and cfg.embedder == 'scratch' and scratch_model_info() is None:
         return jsonify({'message': 'No trained from-scratch embedder is installed on the server. '
@@ -635,7 +713,7 @@ def process_rag(current_user):
         return jsonify({'message': 'The server has no HF_TOKEN set, so it cannot create embeddings. '
                                    'Add HF_TOKEN, or turn embeddings off to export chunks only.'}), 400
 
-    output_path = os.path.join(app.config['PROCESSED_FOLDER'], f"rag_{file_obj.filename.rsplit('.', 1)[0]}.jsonl")
+    output_path = os.path.join(app.config['PROCESSED_FOLDER'], f"rag_{_stamp()}_{file_obj.filename.rsplit('.', 1)[0]}.jsonl")
     job = ProcessedJob(
         user_id=current_user.id,
         file_id=file_obj.id,

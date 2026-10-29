@@ -168,3 +168,16 @@ def fetch_kaggle(
         shutil.rmtree(tmp, ignore_errors=True)
 
     return {"source": "kaggle", "dataset": dataset_slug, "file": target.name, "rows": len(df)}
+
+
+def normalize_dataset_id(source: str, text: str) -> str:
+    """Accept a pasted page URL as well as a plain id: '.../datasets/owner/name[/...]' -> 'owner/name'."""
+    text = (text or "").strip()
+    match = re.match(r"^(?:https?://)?(?:www\.)?(?:huggingface\.co|kaggle\.com)/datasets/([^?#]+)", text, re.I)
+    if not match:
+        return text
+    parts = [p for p in match.group(1).split("/") if p]
+    if source == "huggingface":
+        # either 'name' (legacy canonical dataset) or 'owner/name'; stop before '/viewer', '/tree', ...
+        return "/".join(parts[:2]) if len(parts) > 1 and parts[1] not in ("viewer", "tree", "blob", "resolve", "discussions") else parts[0]
+    return "/".join(parts[:2])

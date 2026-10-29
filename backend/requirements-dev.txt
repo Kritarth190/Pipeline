@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest
+pytest-timeout
+# Optional: lets tests/test_integration.py also exercise tools/train_embedder.py
+# torch

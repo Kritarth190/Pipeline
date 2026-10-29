@@ -61,7 +61,7 @@ class RAGConfig:
     @classmethod
     def from_dict(cls, raw: Optional[Dict[str, Any]], max_rows_cap: int = 20000) -> "RAGConfig":
         """Build a config from untrusted user input, clamping every value."""
-        raw = raw or {}
+        raw = raw if isinstance(raw, dict) else {}
         cfg = cls()
 
         def str_list(value) -> List[str]:
@@ -102,7 +102,8 @@ class RAGConfig:
 # TEXT CLEANING
 # ============================================================================
 
-_TAG_RE = re.compile(r"<[^>]+>")
+# Only real markup: <tag ...>, </tag>, <!-- comment -->. Plain "x < 5 and y > 3" must survive.
+_TAG_RE = re.compile(r"<!--.*?-->|</?[A-Za-z][^<>]*>", re.DOTALL)
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SPACE_RE = re.compile(r"[ \t\r\f\v]+")
 _BLANKS_RE = re.compile(r"\n{3,}")
@@ -296,12 +297,17 @@ def get_embedder(cfg: RAGConfig) -> Embedder:
 
 def load_text_table(path: str, max_rows: int) -> pd.DataFrame:
     """Read a CSV/TXT upload. A plain text file (one document per line) becomes a `text` column."""
+    is_csv = str(path).lower().endswith(".csv")
     try:
         df = pd.read_csv(path, nrows=max_rows)
-        if len(df.columns) > 1 or str(path).lower().endswith(".csv"):
+        if len(df.columns) > 1 or is_csv:
             return df
-    except Exception:
-        pass
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+    except Exception as exc:
+        if is_csv:
+            # Falling back to "one document per line" would turn the header row into a document
+            raise ValueError(f"Could not read this CSV (a row probably has the wrong number of fields): {exc}") from exc
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         lines = [line.rstrip("\n") for _, line in zip(range(max_rows), fh)]
     return pd.DataFrame({"text": [ln for ln in lines if ln.strip()]})
@@ -361,12 +367,23 @@ def _auto_metadata_columns(df: pd.DataFrame, text_cols: List[str], id_col: Optio
     return picked
 
 
+def _doc_label(value: Any) -> str:
+    """Id as text: 3.0 (an int column that gained a NaN) reads as '3', not '3.0'."""
+    if isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def _iter_documents(df: pd.DataFrame, text_cols: List[str], id_col: Optional[str], meta_cols: List[str]) -> Iterator[Dict[str, Any]]:
+    used_ids: set = set()
     for pos, row in enumerate(df.itertuples(index=False, name=None)):
         record = dict(zip(df.columns, row))
         parts = [clean_text(record[c]) for c in text_cols]
         text = "\n\n".join(p for p in parts if p)
-        doc_id = str(record[id_col]) if id_col and pd.notna(record[id_col]) else str(pos)
+        doc_id = _doc_label(record[id_col]) if id_col and pd.notna(record[id_col]) else str(pos)
+        if doc_id in used_ids:  # repeated or colliding ids would make chunk_ids ambiguous
+            doc_id = f"{doc_id}-{pos}"
+        used_ids.add(doc_id)
         yield {"doc_id": doc_id, "text": text, "metadata": {c: _json_safe(record[c]) for c in meta_cols}}
 
 

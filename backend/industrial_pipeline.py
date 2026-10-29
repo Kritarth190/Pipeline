@@ -351,6 +351,9 @@ class DataIngestionStage(PipelineStage):
         super().__init__("Data Ingestion")
     
     def process(self, data: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
+        # A file with a header but no rows is an empty upload, not a request for sample data
+        if data is not None and data.empty and len(data.columns) > 0:
+            raise ValueError("The uploaded file has column headers but no data rows")
         # Check if user provided real data
         if data is not None and not data.empty:
             self.log_info(f"Processing uploaded data: {len(data)} rows × {len(data.columns)} columns")
@@ -397,6 +400,7 @@ class ValidationStage(PipelineStage):
         if not config.validation_enabled:
             return data
         
+        data = data.copy()  # never modify the caller's DataFrame
         initial_count = len(data)
         quality_issues = []
         
@@ -417,11 +421,12 @@ class ValidationStage(PipelineStage):
         # Validate numeric columns (flexible - works with any numeric data)
         numeric_cols = data.select_dtypes(include=[np.number]).columns
         
-        valid_mask = pd.Series([True] * len(data))
+        valid_mask = pd.Series(True, index=data.index)
         
         for col in numeric_cols:
             # Check for inf and extreme outliers
-            col_valid = np.isfinite(data[col])
+            # NaN means "missing" (the cleaning stage imputes it); only +/-inf is invalid here
+            col_valid = ~np.isinf(data[col])
             
             # Check for reasonable ranges (very permissive)
             if col_valid.sum() > 0:
@@ -433,7 +438,7 @@ class ValidationStage(PipelineStage):
                 if range_span > 0:
                     extreme_low = q1 - (range_span * 100)
                     extreme_high = q99 + (range_span * 100)
-                    col_valid &= (data[col] >= extreme_low) & (data[col] <= extreme_high)
+                    col_valid &= data[col].isna() | ((data[col] >= extreme_low) & (data[col] <= extreme_high))
             
             invalid_count = (~col_valid).sum()
             if invalid_count > 0:
@@ -969,7 +974,7 @@ class IndustrialDataPipeline:
         start_time = time.time()
         
         try:
-            data = input_data if input_data is not None else pd.DataFrame()
+            data = input_data.copy() if input_data is not None else pd.DataFrame()
             self.metrics.total_records = len(data) if not data.empty else self.config.batch_size
             
             # Execute each stage
@@ -996,9 +1001,9 @@ class IndustrialDataPipeline:
             self.metrics.throughput = self.metrics.valid_records / max(self.metrics.processing_time, 0.001)
             
             # Get quality score from validation stage
-            validation_stage = next((s for s in self.stages if isinstance(s, ValidationStage)), None)
-            if validation_stage:
-                self.metrics.data_quality_score = validation_stage.quality_score
+            # Quality = share of input records that survived every stage (validation, outliers, duplicates)
+            if self.metrics.total_records > 0:
+                self.metrics.data_quality_score = min(1.0, self.metrics.valid_records / self.metrics.total_records)
             
             # Save version
             if self.version_manager:
