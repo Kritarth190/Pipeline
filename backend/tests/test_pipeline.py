@@ -201,8 +201,8 @@ class TestIngestion:
     def test_uploaded_header_only_file_is_not_replaced_by_fake_data(self):
         # An uploaded file with a header and no rows is "no data", not a request for sample data.
         empty = pd.DataFrame({"temperature": [], "pressure": []})
-        out = DataIngestionStage().process(empty, cfg(batch_size=0))
-        assert "machine_id" not in out.columns, "synthetic sensor data was silently substituted for the upload"
+        with pytest.raises(ValueError, match="no data rows"):
+            DataIngestionStage().process(empty, cfg(batch_size=0))
 
 
 # ------------------------------------------------------------ version manager

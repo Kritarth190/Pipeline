@@ -186,8 +186,8 @@ class TestLoadTextTable:
         # quietly become a "document" (that would pollute the dataset with a row of column names).
         p = tmp_path / "bad.csv"
         p.write_text("id,text\n1,hello\n2,a,b,c,d\n3,fine\n")
-        df = load_text_table(str(p), 10)
-        assert "id,text" not in df.iloc[:, 0].astype(str).tolist()
+        with pytest.raises(ValueError, match="Could not read this CSV"):
+            load_text_table(str(p), 10)
 
 
 # ---------------------------------------------------------------- build_rag_dataset
