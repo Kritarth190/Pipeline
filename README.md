@@ -71,6 +71,32 @@ Good to know:
 - Queries must be embedded with the same model (`from scratch_embedder import ScratchEmbedder`).
   If you retrain, re-embed everything.
 
+## Security
+
+The backend has a few protections worth knowing about when you deploy it:
+
+- **Rate limiting.** Login, registration, dataset imports and RAG jobs are capped per IP
+  (e.g. 10 login attempts/minute, 10 registrations/hour) to slow brute-forcing and job-spam.
+  It's on by default; set `RATELIMIT_ENABLED=false` to disable it, or `RATELIMIT_STORAGE_URI`
+  (e.g. a Redis URL) to share limits across more than one gunicorn worker/dyno — the default
+  in-memory store is per-process.
+- **Per-user storage quota.** Each account is capped at `MAX_USER_STORAGE_BYTES` (default
+  500 MB) across uploads and imports combined, so one user can't fill the free tier's disk.
+- **Password policy.** Registration requires at least 8 characters.
+- **No account enumeration.** A duplicate username and a duplicate email return the same
+  "Username or email already registered" message.
+- **Formula-injection defused.** Text that would be read as a spreadsheet formula (starts
+  with `=`, `+`, `-` or `@`) is prefixed with `'` in every CSV/JSONL export, so opening a
+  download in Excel/Sheets can't execute it.
+- **Safe zip extraction.** Kaggle dataset archives are extracted with a path check that
+  refuses any entry that would land outside the target folder ("zip slip").
+- **Scrubbed error messages.** Exceptions shown to users (and stored on failed jobs) have the
+  server's internal file paths stripped out first.
+
+Always set a real `SECRET_KEY` in production — without one the app falls back to a random key
+per process, which invalidates every login on restart and (with more than one worker) can make
+tokens fail unpredictably depending on which worker issued them.
+
 ## Usage
 
 1. Register a new account

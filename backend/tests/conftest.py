@@ -28,6 +28,9 @@ os.environ["SECRET_KEY"] = "test-secret-key-test-secret-key-1234"
 os.environ["FRONTEND_URL"] = "https://app.example.com"
 os.environ.pop("HF_TOKEN", None)
 os.environ["SCRATCH_EMBEDDER_DIR"] = str(TMP / "no-model")
+# The suite makes far more requests per minute than a real client ever would; rate limiting
+# itself is covered by its own tests (test_rate_limiting.py), which enable it explicitly.
+os.environ["RATELIMIT_ENABLED"] = "false"
 
 
 @pytest.fixture(scope="session")
@@ -67,8 +70,8 @@ def user(client):
 @pytest.fixture()
 def other_user(client):
     name = f"other_{uuid.uuid4().hex[:10]}"
-    client.post("/api/register", json={"username": name, "email": f"{name}@x.com", "password": "pw"})
-    token = client.post("/api/login", json={"username": name, "password": "pw"}).get_json()["token"]
+    client.post("/api/register", json={"username": name, "email": f"{name}@x.com", "password": "pw1234567"})
+    token = client.post("/api/login", json={"username": name, "password": "pw1234567"}).get_json()["token"]
     return {"headers": {"Authorization": f"Bearer {token}"}, "username": name}
 
 

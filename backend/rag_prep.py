@@ -109,6 +109,19 @@ _SPACE_RE = re.compile(r"[ \t\r\f\v]+")
 _BLANKS_RE = re.compile(r"\n{3,}")
 
 
+# A leading one of these makes some spreadsheet apps evaluate the cell as a formula if the
+# export is ever opened there (CSV/JSONL "formula injection"). A leading straight quote
+# defangs it without changing what the value reads as.
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value: Any) -> Any:
+    """Defang a string that a spreadsheet app would read as a formula."""
+    if isinstance(value, str) and value[:1] in _FORMULA_LEAD:
+        return "'" + value
+    return value
+
+
 def clean_text(value: Any) -> str:
     """Normalise one text value: unescape HTML, strip tags/control chars, tidy whitespace."""
     if value is None or (isinstance(value, float) and math.isnan(value)):
@@ -483,13 +496,15 @@ def build_rag_dataset(
                     if not pieces:
                         stats["documents_skipped_empty"] += 1
                     for k, piece in enumerate(pieces):
+                        piece = {**piece, "text": csv_safe(piece["text"])}
+                        metadata = {mk: csv_safe(mv) for mk, mv in doc["metadata"].items()}
                         pending.append(
                             {
                                 "chunk_id": f"{doc['doc_id']}::{k}",
                                 "doc_id": doc["doc_id"],
                                 "chunk_index": k,
                                 **piece,
-                                "metadata": doc["metadata"],
+                                "metadata": metadata,
                             }
                         )
                         stats["total_tokens"] += piece["token_count"]

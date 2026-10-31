@@ -33,6 +33,17 @@ class DatasetImportError(Exception):
     """A problem the user can fix (bad id, private dataset, missing credentials...)."""
 
 
+def _safe_extract(zf, dest: str) -> None:
+    """extractall(), but refuse any entry whose name would land outside `dest` ("zip slip"):
+    a '../' path, or an absolute path, could otherwise overwrite files elsewhere on disk."""
+    dest_root = os.path.realpath(dest)
+    for member in zf.infolist():
+        target = os.path.realpath(os.path.join(dest_root, member.filename))
+        if os.path.commonpath([dest_root, target]) != dest_root:
+            raise DatasetImportError(f"Refusing to extract unsafe archive entry: {member.filename!r}")
+    zf.extractall(dest_root)
+
+
 def _hf_headers() -> Dict[str, str]:
     token = os.environ.get("HF_TOKEN")
     return {"Authorization": f"Bearer {token}"} if token else {}
@@ -158,7 +169,7 @@ def fetch_kaggle(
             import zipfile
 
             with zipfile.ZipFile(downloaded) as zf:
-                zf.extractall(tmp)
+                _safe_extract(zf, tmp)
             downloaded = next((p for p in Path(tmp).rglob("*.csv")), None)
             if downloaded is None:
                 raise DatasetImportError("The downloaded archive has no CSV")
