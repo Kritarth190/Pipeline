@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import jwt
@@ -18,7 +20,7 @@ import logging
 import uuid
 from werkzeug.exceptions import HTTPException
 
-from rag_prep import RAGConfig, build_rag_dataset, analyze_text_columns, load_text_table
+from rag_prep import RAGConfig, build_rag_dataset, analyze_text_columns, load_text_table, csv_safe
 from dataset_sources import fetch_huggingface, fetch_kaggle, normalize_dataset_id, DatasetImportError
 from scratch_embedder import scratch_model_info
 from industrial_pipeline import (
@@ -54,8 +56,25 @@ app.config['PROCESSED_FOLDER'] = os.path.abspath('./processed')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
 # Hard ceiling on rows per RAG job / dataset import (protects small free-tier hosts)
 MAX_RAG_ROWS = int(os.environ.get('MAX_RAG_ROWS', '20000'))
+# Hard ceiling on bytes one account may have on disk at once (uploads + imports), so a
+# single user can't fill the free tier's small, ephemeral disk.
+MAX_USER_STORAGE_BYTES = int(os.environ.get('MAX_USER_STORAGE_BYTES', str(500 * 1024 * 1024)))
 
 db = SQLAlchemy(app)
+
+# Rate limiting: brute-force login/registration and job-spamming cost real money or quota
+# on free-tier hosts (and on Kaggle/HF for dataset imports), so sensitive routes are capped
+# per IP. The default in-memory store is per-process: on a multi-worker/multi-dyno deploy,
+# set RATELIMIT_STORAGE_URI (e.g. to the same Redis most hosts already offer) for it to be
+# shared; a single free-tier gunicorn worker works fine with the default. Set
+# RATELIMIT_ENABLED=false to turn it off entirely (the test suite does this).
+app.config['RATELIMIT_ENABLED'] = os.environ.get('RATELIMIT_ENABLED', 'true').lower() != 'false'
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    storage_uri=os.environ.get('RATELIMIT_STORAGE_URI', 'memory://'),
+    default_limits=[],
+)
 
 # Create necessary directories
 Path(app.config['UPLOAD_FOLDER']).mkdir(parents=True, exist_ok=True)
@@ -157,6 +176,29 @@ class ProcessedJob(db.Model):
 # ============================================================================
 
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+MIN_PASSWORD_LENGTH = 8
+
+
+def scrub_error(exc):
+    """Message safe to show a user: real server paths removed, exception type kept."""
+    text = str(exc)
+    for folder in (app.config['UPLOAD_FOLDER'], app.config['PROCESSED_FOLDER'], os.getcwd()):
+        text = text.replace(folder + os.sep, '').replace(folder, '')
+    return text
+
+
+def sanitize_for_csv(df):
+    """Return a copy of df with every text cell passed through csv_safe.
+
+    Checks is_object_dtype too, not just dtype == object: pandas' newer string dtype
+    (pd.StringDtype, used when a column is all-string) does not equal `object`, so that
+    check alone silently skips those columns.
+    """
+    df = df.copy()
+    for col in df.columns:
+        if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
+            df[col] = df[col].map(csv_safe)
+    return df
 
 
 def _stamp():
@@ -231,26 +273,32 @@ def token_required(f):
 # ============================================================================
 
 @app.route('/api/register', methods=['POST'])
+@limiter.limit('10 per hour')
 def register():
     """Register a new user"""
     data = _body()
     username = str(data.get('username') or '').strip()
     email = str(data.get('email') or '').strip().lower()
-    
-    if not username or not email or not data.get('password'):
+    password = data.get('password') or ''
+
+    if not username or not email or not password:
         return jsonify({'message': 'Missing required fields'}), 400
-    
+
     if not EMAIL_RE.match(email):
         return jsonify({'message': 'Please enter a valid email address'}), 400
-    
-    if User.query.filter_by(username=username).first():
-        return jsonify({'message': 'Username already exists'}), 400
-    
-    if User.query.filter(db.func.lower(User.email) == email).first():
-        return jsonify({'message': 'Email already exists'}), 400
-    
+
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return jsonify({'message': f'Password must be at least {MIN_PASSWORD_LENGTH} characters'}), 400
+
+    # One generic message for both clashes: telling the two apart lets someone enumerate
+    # which usernames/emails are already registered.
+    taken = (User.query.filter_by(username=username).first()
+             or User.query.filter(db.func.lower(User.email) == email).first())
+    if taken:
+        return jsonify({'message': 'Username or email already registered'}), 400
+
     user = User(username=username, email=email)
-    user.set_password(data['password'])
+    user.set_password(password)
     
     db.session.add(user)
     db.session.commit()
@@ -262,6 +310,7 @@ def register():
 
 
 @app.route('/api/login', methods=['POST'])
+@limiter.limit('10 per minute')
 def login():
     """Login user and return JWT token"""
     data = _body()
@@ -289,30 +338,47 @@ def login():
 # API ROUTES - FILE MANAGEMENT
 # ============================================================================
 
+def _user_storage_used(user_id):
+    total = db.session.query(db.func.coalesce(db.func.sum(UploadedFile.file_size), 0)) \
+        .filter_by(user_id=user_id).scalar()
+    return int(total or 0)
+
+
 @app.route('/api/files/upload', methods=['POST'])
 @token_required
+@limiter.limit('30 per minute')
 def upload_file(current_user):
     """Upload a file"""
     if 'file' not in request.files:
         return jsonify({'message': 'No file provided'}), 400
-    
+
     file = request.files['file']
-    
+
     if file.filename == '':
         return jsonify({'message': 'No file selected'}), 400
-    
+
     if not file.filename.lower().endswith(('.csv', '.txt')):
         return jsonify({'message': 'Only CSV and TXT files are allowed'}), 400
-    
+
+    used = _user_storage_used(current_user.id)
+    if used >= MAX_USER_STORAGE_BYTES:
+        return jsonify({'message': 'Storage limit reached. Delete some files before uploading more.'}), 400
+
     # secure_filename drops non-ASCII letters (even the whole name), so keep the extension separately
     stem, ext = os.path.splitext(file.filename)
     original_filename = f"{secure_filename(stem) or 'file'}{ext.lower()}"
     filename = f"{current_user.id}_{_stamp()}_{original_filename}"
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    
+
     file.save(file_path)
     file_size = os.path.getsize(file_path)
-    
+
+    # Re-check after writing: Content-Length can't be trusted ahead of time (chunked uploads,
+    # or a client that lies), so this is the real guard against a user quietly busting the quota.
+    if used + file_size > MAX_USER_STORAGE_BYTES:
+        _remove_quietly(file_path)
+        return jsonify({'message': 'Storage limit reached. Delete some files before uploading more.'}), 400
+
     uploaded_file = UploadedFile(
         user_id=current_user.id,
         filename=filename,
@@ -320,10 +386,10 @@ def upload_file(current_user):
         file_path=file_path,
         file_size=file_size
     )
-    
+
     db.session.add(uploaded_file)
     db.session.commit()
-    
+
     return jsonify({
         'message': 'File uploaded successfully',
         'file': uploaded_file.to_dict()
@@ -453,7 +519,7 @@ def process_data(current_user):
         # Save processed data
         output_filename = f"processed_{_stamp()}_{file_obj.filename}"
         output_path = os.path.join(app.config['PROCESSED_FOLDER'], output_filename)
-        processed_data.to_csv(output_path, index=False)
+        sanitize_for_csv(processed_data).to_csv(output_path, index=False)
         
         # Create job record with analysis info
         job = ProcessedJob(
@@ -503,15 +569,15 @@ def process_data(current_user):
             user_id=current_user.id,
             file_id=file_obj.id,
             status='failed',
-            error_message=str(e)
+            error_message=scrub_error(e)
         )
-        
+
         db.session.add(job)
         db.session.commit()
-        
+
         return jsonify({
             'message': 'Processing failed',
-            'error': str(e)
+            'error': scrub_error(e)
         }), 500
 
 
@@ -570,6 +636,8 @@ _rag_slot = threading.Semaphore(1)
 
 def _save_imported_csv(current_user, label, writer):
     """Create the UploadedFile row for a dataset fetched from a remote source."""
+    if _user_storage_used(current_user.id) >= MAX_USER_STORAGE_BYTES:
+        raise DatasetImportError('Storage limit reached. Delete some files before importing more.')
     safe_label = secure_filename(label) or 'dataset'
     filename = f"{current_user.id}_{_stamp()}_{safe_label}.csv"
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
@@ -588,6 +656,7 @@ def _save_imported_csv(current_user, label, writer):
 
 @app.route('/api/datasets/import', methods=['POST'])
 @token_required
+@limiter.limit('10 per hour')
 def import_dataset(current_user):
     """Import a dataset from Hugging Face or Kaggle as an uploaded file."""
     data = _body()
@@ -631,7 +700,7 @@ def file_columns(current_user, file_id):
         df = load_text_table(file_obj.file_path, 500)
         return jsonify(analyze_text_columns(df)), 200
     except Exception as e:
-        return jsonify({'message': f'Could not read file: {e}'}), 400
+        return jsonify({'message': f'Could not read file: {scrub_error(e)}'}), 400
 
 
 def _run_rag_job(job_id, file_path, output_path, cfg):
@@ -661,7 +730,7 @@ def _run_rag_job(job_id, file_path, output_path, cfg):
             job = db.session.get(ProcessedJob, job_id)
             file_obj = db.session.get(UploadedFile, job.file_id)
             job.status = 'failed'
-            job.error_message = str(e)
+            job.error_message = scrub_error(e)
             file_obj.status = 'error'
             _remove_quietly(output_path)  # never leave a half-written file behind
         finally:
@@ -685,6 +754,7 @@ def list_embedders(current_user):
 
 @app.route('/api/rag/process', methods=['POST'])
 @token_required
+@limiter.limit('20 per hour')
 def process_rag(current_user):
     """Start a background job: clean -> tokenize/chunk -> embed -> JSONL."""
     data = _body()

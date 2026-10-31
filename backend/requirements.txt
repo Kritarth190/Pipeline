@@ -13,3 +13,4 @@ huggingface_hub
 kaggle
 # Optional: local embeddings instead of the Hugging Face API (needs ~200 MB RAM)
 # fastembed
+flask-limiter

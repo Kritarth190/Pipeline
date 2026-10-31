@@ -75,10 +75,10 @@ class TestBasics:
 class TestAuth:
     def test_register_and_login(self, client):
         name = f"u_{uuid.uuid4().hex[:8]}"
-        r = client.post("/api/register", json={"username": name, "email": f"{name}@x.com", "password": "secret1"})
+        r = client.post("/api/register", json={"username": name, "email": f"{name}@x.com", "password": "secret123"})
         assert r.status_code == 201 and "password" not in json.dumps(r.get_json())
         assert "hash" not in json.dumps(r.get_json())
-        ok = client.post("/api/login", json={"username": name, "password": "secret1"})
+        ok = client.post("/api/login", json={"username": name, "password": "secret123"})
         assert ok.status_code == 200 and ok.get_json()["token"]
 
     @pytest.mark.parametrize("body", [{}, {"username": "a"}, {"username": "a", "email": "a@x.com"},

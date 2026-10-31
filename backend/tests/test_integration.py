@@ -54,8 +54,8 @@ def server(tmp_path_factory):
 def session(server):
     name = "i_" + uuid.uuid4().hex[:8]
     b = server["base"]
-    assert requests.post(f"{b}/register", json={"username": name, "email": f"{name}@x.com", "password": "pw12345"}).status_code == 201
-    token = requests.post(f"{b}/login", json={"username": name, "password": "pw12345"}).json()["token"]
+    assert requests.post(f"{b}/register", json={"username": name, "email": f"{name}@x.com", "password": "pw1234567"}).status_code == 201
+    token = requests.post(f"{b}/login", json={"username": name, "password": "pw1234567"}).json()["token"]
     s = requests.Session()
     s.headers["Authorization"] = f"Bearer {token}"
     return s
