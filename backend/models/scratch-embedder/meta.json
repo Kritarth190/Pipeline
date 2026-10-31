@@ -1,0 +1,22 @@
+{
+  "name": "ag-news-general",
+  "format": 1,
+  "dim": 128,
+  "vocab_size": 8000,
+  "max_len": 512,
+  "pooling": "softplus-weighted mean",
+  "trained_on": {
+    "chunks": 20038,
+    "groups": 20000,
+    "epochs": 12,
+    "group_key": "doc_id",
+    "seconds": 26.7
+  },
+  "heldout_eval": {
+    "candidates": 1000,
+    "recall@1": 1.0,
+    "recall@5": 1.0,
+    "mrr": 1.0,
+    "random_recall@1": 0.001
+  }
+}
